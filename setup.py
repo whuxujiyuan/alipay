@@ -24,7 +24,7 @@ setup(
     license="BSD",
     keywords="python sdk alipay",
     url="https://github.com/fzlee/alipay",
-    packages=['alipay'],
+    packages=['alipay_third'],
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Topic :: Utilities",
