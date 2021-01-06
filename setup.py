@@ -16,7 +16,7 @@ def alipay_test_suite():
 
 
 setup(
-    name="python-alipay-sdk",
+    name="python-alipay-third",
     version="2.1.1",
     author="fzlee",
     author_email="fzleee@gmail.com",
