@@ -18,6 +18,7 @@ from Cryptodome.Signature import PKCS1_v1_5
 from .compat import decodebytes, encodebytes, quote_plus, urlopen
 from .exceptions import AliPayException, AliPayValidationError
 from .utils import AliPayConfig
+from .loggers import logger
 
 
 # 常见加密算法
@@ -59,6 +60,7 @@ class BaseAliPay:
         alipay_public_key_string=None,
         sign_type="RSA2",
         debug=False,
+        verbose=False,
         config=None
     ):
         """
@@ -73,6 +75,7 @@ class BaseAliPay:
         self._app_notify_url = app_notify_url
         self._app_private_key_string = app_private_key_string
         self._alipay_public_key_string = alipay_public_key_string
+        self._verbose = verbose
         self._config = config or AliPayConfig()
 
         self._app_private_key = None
@@ -135,9 +138,7 @@ class BaseAliPay:
                 data[k] = json.dumps(v, separators=(',', ':'))
         return sorted(data.items())
 
-    def build_body(
-        self, method, biz_content, return_url=None, notify_url=None, append_auth_token=False
-    ):
+    def build_body(self, method, biz_content, **kwargs):
         data = {
             "app_id": self._appid,
             "method": method,
@@ -147,22 +148,21 @@ class BaseAliPay:
             "version": "1.0",
             "biz_content": biz_content
         }
-        if append_auth_token:
-            data["app_auth_token"] = self.app_auth_token
-
-        if return_url is not None:
-            data["return_url"] = return_url
+        data.update(kwargs)
 
         if method in (
-            "alipay.trade.app.pay", "alipay.trade.wap.pay", "alipay.trade.page.pay",
-            "alipay.trade.pay", "alipay.trade.precreate"
-        ) and (notify_url or self._app_notify_url):
-            data["notify_url"] = notify_url or self._app_notify_url
+            "alipay.trade.app.pay", "alipay.trade.wap.pay",
+            "alipay.trade.page.pay", "alipay.trade.pay",
+            "alipay.trade.precreate"
+        ) and not data.get("notify_url") and self._app_notify_url:
+            data["notify_url"] = self._app_notify_url
 
+        if self._verbose:
+            logger.debug("data to be signed")
+            logger.debug(data)
         return data
 
     def sign_data(self, data):
-        data.pop("sign", None)
         # 排序后的字符串
         ordered_items = self._ordered_data(data)
         raw_string = "&".join("{}={}".format(k, v) for k, v in ordered_items)
@@ -171,6 +171,9 @@ class BaseAliPay:
 
         # 获得最终的订单信息字符串
         signed_string = "&".join("{}={}".format(k, quote_plus(v)) for k, v in unquoted_items)
+        if self._verbose:
+            logger.debug("signed srtring")
+            logger.debug(signed_string)
         return signed_string
 
     def _verify(self, raw_content, signature):
@@ -194,15 +197,22 @@ class BaseAliPay:
         message = "&".join(u"{}={}".format(k, v) for k, v in unsigned_items)
         return self._verify(message, signature)
 
-    def api(self, api_name, **kwargs):
+    def client_api(self, api_name, biz_content, **kwargs):
         """
-        alipay.api("alipay.trade.page.pay", **kwargs) ==> alipay.api_alipay_trade_page_pay(**kwargs)
+        alipay api without http request
         """
-        api_name = api_name.replace(".", "_")
-        key = "api_" + api_name
-        if hasattr(self, key):
-            return getattr(self, key)
-        raise AttributeError("Unknown attribute" + api_name)
+        data = self.build_body(api_name, biz_content, **kwargs)
+        return self.sign_data(data)
+
+    def server_api(self, api_name, biz_content, **kwargs):
+        """
+        alipay api with http request
+        """
+        data = self.build_body(api_name, biz_content, **kwargs)
+        # alipay.trade.query => alipay_trade_query_response
+        response_type = api_name.replace(".", "_") + "_response"
+        print(data)
+        return self.verified_sync_response(data, response_type)
 
     def api_alipay_trade_wap_pay(
         self, subject, out_trade_no, total_amount,
@@ -536,6 +546,20 @@ class BaseAliPay:
         response_type = "alipay_trade_order_settle_response"
         return self.verified_sync_response(data, response_type)
 
+    def api_alipay_ebpp_invoice_token_batchquery(self, invoice_token=None, scene=None):
+        if scene is None:
+            scene = "INVOICE_EXPENSE"
+        if invoice_token is None:
+            raise Exception("invoice_token is None!")
+
+        biz_content = {
+            "invoice_token": invoice_token,
+            "scene": scene
+        }
+        data = self.build_body("alipay.ebpp.invoice.token.batchquery", biz_content)
+        response_type = "alipay_ebpp_invoice_token_batchquery_response"
+        return self.verified_sync_response(data, response_type)
+
     def _verify_and_return_sync_response(self, raw_string, response_type):
         """
         return response if verification succeeded, raise exception if not
@@ -655,6 +679,9 @@ class DCAliPay(BaseAliPay):
         data = super().build_body(*args, **kwargs)
         data["app_cert_sn"] = self.app_cert_sn
         data["alipay_root_cert_sn"] = self.alipay_root_cert_sn
+        if self._verbose:
+            logger.debug("data to be signed")
+            logger.debug(data)
         return data
 
     def load_alipay_public_key_string(self):
@@ -719,6 +746,32 @@ class DCAliPay(BaseAliPay):
             self._alipay_root_cert_sn = self.get_root_cert_sn(self._alipay_root_cert_string)
         return getattr(self, "_alipay_root_cert_sn")
 
+    def api_alipay_fund_trans_uni_transfer(
+        self, out_biz_no, identity_type, identity, trans_amount, name=None, **kwargs
+    ):
+        """
+        单笔转账接口, 只支持公钥证书模式
+        文档地址: https://opendocs.alipay.com/apis/api_28/alipay.fund.trans.uni.transfer
+        """
+        assert identity_type in ("ALIPAY_USER_ID", "ALIPAY_LOGON_ID"), "unknown identity type"
+
+        biz_content = {
+            "payee_info": {
+                "identity": identity,
+                "identity_type": identity_type,
+            },
+            "out_biz_no": out_biz_no,
+            "trans_amount": trans_amount,
+            "product_code": "TRANS_ACCOUNT_NO_PWD",
+            "biz_scene": "DIRECT_TRANSFER",
+        }
+        biz_content["payee_info"]["name"] = name if name else None
+        biz_content.update(kwargs)
+
+        response_type = "alipay_fund_trans_uni_transfer_response"
+        data = self.build_body("alipay.fund.trans.uni.transfer", biz_content)
+        return self.verified_sync_response(data, response_type)
+
 
 class ISVAliPay(BaseAliPay):
 
@@ -758,6 +811,16 @@ class ISVAliPay(BaseAliPay):
                 raise Exception(msg.format(self._app_auth_code))
         return self._app_auth_token
 
+    def build_body(self, *args, **kwargs):
+        data = super().build_body(*args, **kwargs)
+        if self._app_auth_token:
+            data["app_auth_token"] = self._app_auth_token
+        if self._verbose:
+            logger.debug("data to be signed")
+            logger.debug(data)
+                
+        return data
+
     def api_alipay_open_auth_token_app(self, refresh_token=None):
         """
         response = {
@@ -785,7 +848,6 @@ class ISVAliPay(BaseAliPay):
         data = self.build_body(
             "alipay.open.auth.token.app",
             biz_content,
-            append_auth_token=False
         )
         response_type = "alipay_open_auth_token_app_response"
         return self.verified_sync_response(data, response_type)
@@ -795,7 +857,6 @@ class ISVAliPay(BaseAliPay):
         data = self.build_body(
             "alipay.open.auth.token.app.query",
             biz_content,
-            append_auth_token=False
         )
         response_type = "alipay_open_auth_token_app_query_response"
         return self.verified_sync_response(data, response_type)
